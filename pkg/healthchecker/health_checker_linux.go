@@ -17,39 +17,59 @@ limitations under the License.
 package healthchecker
 
 import (
-	"errors"
-	"strconv"
+	"fmt"
+	"github.com/coreos/go-systemd/sdjournal"
+	"k8s.io/node-problem-detector/cmd/healthchecker/options"
+	"k8s.io/node-problem-detector/pkg/healthchecker/types"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
-
-	"k8s.io/node-problem-detector/cmd/healthchecker/options"
-	"k8s.io/node-problem-detector/pkg/healthchecker/types"
+	"github.com/coreos/go-systemd/dbus"
 )
 
 // getUptimeFunc returns the time for which the given service has been running.
 func getUptimeFunc(service string) func() (time.Duration, error) {
 	return func() (time.Duration, error) {
+		conn, err := dbus.New()
+		if err != nil {
+			return time.Duration(0), fmt.Errorf("failed to connect to D-Bus: %w", err)
+		}
+		defer func() {
+			if conn != nil {
+				conn.Close()
+			}
+		}()
+
+		unitName := service + ".service"
+		props, err := conn.GetUnitProperties(unitName)
+		if err != nil {
+			return time.Duration(0), fmt.Errorf("failed to get properties for service %s: %w", unitName, err)
+		}
+		if props == nil {
+			return time.Duration(0), fmt.Errorf("no properties found for service %s", unitName)
+		}
+
 		// Using InactiveExitTimestamp to capture the exact time when systemd tried starting the service. The service will
 		// transition from inactive -> activating and the timestamp is captured.
 		// Source : https://www.freedesktop.org/wiki/Software/systemd/dbus/
 		// Using ActiveEnterTimestamp resulted in race condition where the service was repeatedly killed by plugin when
 		// RestartSec of systemd and invoke interval of plugin got in sync. The service was repeatedly killed in
 		// activating state and hence ActiveEnterTimestamp was never updated.
-		out, err := execCommand(types.CmdTimeout, "systemctl", "show", service, "--property=InactiveExitTimestamp")
+		inactiveExitTimestamp, ok := props["InactiveExitTimestamp"]
+		if !ok {
+			return time.Duration(0), fmt.Errorf("failed to retrieve the uptime for service %s", unitName)
+		}
 
+		val, ok := inactiveExitTimestamp.(string)
+		if !ok {
+			return time.Duration(0), fmt.Errorf("failed to parse the uptime for service %s", unitName)
+		}
+
+		t, err := time.Parse(time.RFC3339Nano, val)
 		if err != nil {
-			return time.Duration(0), err
+			return time.Duration(0), fmt.Errorf("failed to parse the uptime timestamp for service %s: %w", unitName, err)
 		}
-		val := strings.Split(out, "=")
-		if len(val) < 2 {
-			return time.Duration(0), errors.New("could not parse the service uptime time correctly")
-		}
-		t, err := time.Parse(types.UptimeTimeLayout, val[1])
-		if err != nil {
-			return time.Duration(0), err
-		}
+
 		return time.Since(t), nil
 	}
 }
@@ -75,24 +95,57 @@ func getRepairFunc(hco *options.HealthCheckerOptions) func() {
 // checkForPattern returns (true, nil) if logPattern occurs less than logCountThreshold number of times since last
 // service restart. (false, nil) otherwise.
 func checkForPattern(service, logStartTime, logPattern string, logCountThreshold int) (bool, error) {
-	out, err := execCommand(types.CmdTimeout, "/bin/sh", "-c",
-		// Query service logs since the logStartTime
-		`journalctl --unit "`+service+`" --since "`+logStartTime+
-			// Grep the pattern
-			`" | grep -i "`+logPattern+
-			// Get the count of occurrences
-			`" | wc -l`)
+	// Open the systemd journal for reading
+	j, err := sdjournal.NewJournal()
 	if err != nil {
-		return true, err
+		return false, err
 	}
-	occurrences, err := strconv.Atoi(out)
+	defer func() {
+		_ = j.Close()
+	}()
+
+	// Convert logStartTime to time.Time
+	startTime, err := time.Parse(time.RFC3339, logStartTime)
 	if err != nil {
-		return true, err
+		return false, err
 	}
+
+	// Set the starting position for reading journal entries
+	if err := j.SeekRealtimeUsec(uint64(startTime.UnixNano() / 1000)); err != nil {
+		return false, err
+	}
+
+	// Initialize the count of occurrences
+	occurrences := 0
+
+	// Read journal entries
+	for {
+		// Move to the next journal entry
+		if _, err := j.Next(); err != nil {
+			break
+		}
+
+		// Retrieve the log message field
+		msg, err := j.GetData("_MESSAGE")
+		if err != nil {
+			return false, err
+		}
+
+		// Check if the log entry contains the pattern
+		if strings.Contains(strings.ToLower(msg), strings.ToLower(logPattern)) {
+			occurrences++
+		}
+
+		// Break the loop if the count threshold is reached
+		if occurrences >= logCountThreshold {
+			break
+		}
+	}
+
 	if occurrences >= logCountThreshold {
-		glog.Infof("%s failed log pattern check, %s occurrences: %v", service, logPattern, occurrences)
 		return false, nil
 	}
+
 	return true, nil
 }
 
